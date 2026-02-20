@@ -1,0 +1,601 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Jyotish AI — Complete AWS Infrastructure
+  Resources: Cognito, API Gateway (HTTP), Lambda x4, Lambda Layer, DynamoDB x3, IAM Roles
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PARAMETERS
+# ─────────────────────────────────────────────────────────────────────────────
+Parameters:
+  Stage:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment stage (used as suffix on all resource names)
+
+  AnthropicApiKey:
+    Type: String
+    NoEcho: true
+    Description: Anthropic API key for Claude AI (from console.anthropic.com)
+
+  LambdaCodeBucket:
+    Type: String
+    Description: S3 bucket containing pre-uploaded Lambda zips and layer zip
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RESOURCES
+# ─────────────────────────────────────────────────────────────────────────────
+Resources:
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # IAM ROLES
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  # Shared role for Chart, Panchanga, AI-Chat Lambdas (no DynamoDB needed)
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'jyotish-lambda-role-${Stage}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Tags:
+        - Key: Project
+          Value: jyotish-ai
+
+  # Dedicated role for Booking Lambda (needs DynamoDB CRUD)
+  BookingLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'jyotish-booking-role-${Stage}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt BookingsTable.Arn
+                  - !Sub '${BookingsTable.Arn}/index/*'
+                  - !GetAtt AstrologersTable.Arn
+                  - !GetAtt SlotsTable.Arn
+      Tags:
+        - Key: Project
+          Value: jyotish-ai
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # LAMBDA LAYER
+  # Python deps: PyJHora, FastAPI, Anthropic, Pydantic, etc.
+  # The zip is built and uploaded by deploy.sh before CloudFormation runs.
+  # ═══════════════════════════════════════════════════════════════════════════
+  DependenciesLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub 'jyotish-dependencies-${Stage}'
+      Description: >
+        Python deps for Jyotish AI:
+        PyJHora, fastapi, mangum, pydantic, anthropic, boto3, aws-lambda-powertools
+      Content:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: layers/jyotish-layer.zip
+      CompatibleRuntimes:
+        - python3.11
+      CompatibleArchitectures:
+        - x86_64
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # DYNAMODB TABLES
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  AstrologersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'jyotish-astrologers-${Stage}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Project
+          Value: jyotish-ai
+
+  BookingsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'jyotish-bookings-${Stage}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: booking_id
+          AttributeType: S
+        - AttributeName: user_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: booking_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: user_id-index
+          KeySchema:
+            - AttributeName: user_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: jyotish-ai
+
+  SlotsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'jyotish-slots-${Stage}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: astrologer_id
+          AttributeType: S
+        - AttributeName: date
+          AttributeType: S
+      KeySchema:
+        - AttributeName: astrologer_id
+          KeyType: HASH
+        - AttributeName: date
+          KeyType: RANGE
+      Tags:
+        - Key: Project
+          Value: jyotish-ai
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # COGNITO
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub 'jyotish-users-${Stage}'
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      MfaConfiguration: 'OFF'
+      EmailConfiguration:
+        EmailSendingAccount: COGNITO_DEFAULT
+      Schema:
+        - Name: name
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+        - Name: birth_date
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      UserPoolTags:
+        Project: jyotish-ai
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub 'jyotish-app-${Stage}'
+      UserPoolId: !Ref UserPool
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+      GenerateSecret: false           # Must be false — React Native cannot use client secrets
+      AccessTokenValidity: 24
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: hours
+        RefreshToken: days
+      PreventUserExistenceErrors: ENABLED
+
+  IdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      IdentityPoolName: !Sub 'jyotish_identity_${Stage}'
+      AllowUnauthenticatedIdentities: false
+      CognitoIdentityProviders:
+        - ClientId: !Ref UserPoolClient
+          ProviderName: !GetAtt UserPool.ProviderName
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # LAMBDA FUNCTIONS
+  # Code zips uploaded to S3 by deploy.sh before CloudFormation runs.
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  ChartFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'jyotish-chart-${Stage}'
+      Description: Birth chart + divisional charts + Dasha using PyJHora
+      Runtime: python3.11
+      Architectures: [x86_64]
+      Handler: handler.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: functions/jyotish-chart.zip
+      MemorySize: 1024
+      Timeout: 60
+      Layers:
+        - !Ref DependenciesLayer
+      Environment:
+        Variables:
+          LOG_LEVEL: INFO
+          POWERTOOLS_SERVICE_NAME: jyotish-chart
+      Tags:
+        - Key: Project
+          Value: jyotish-ai
+
+  PanchangaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'jyotish-panchanga-${Stage}'
+      Description: Daily Vedic almanac — Tithi, Nakshatra, Rahu Kaal, Muhurta
+      Runtime: python3.11
+      Architectures: [x86_64]
+      Handler: handler.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: functions/jyotish-panchanga.zip
+      MemorySize: 512
+      Timeout: 30
+      Layers:
+        - !Ref DependenciesLayer
+      Environment:
+        Variables:
+          LOG_LEVEL: INFO
+          POWERTOOLS_SERVICE_NAME: jyotish-panchanga
+      Tags:
+        - Key: Project
+          Value: jyotish-ai
+
+  AIChatFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'jyotish-ai-chat-${Stage}'
+      Description: Vedic astrology AI chat powered by Anthropic Claude
+      Runtime: python3.11
+      Architectures: [x86_64]
+      Handler: handler.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: functions/jyotish-ai-chat.zip
+      MemorySize: 1024
+      Timeout: 60
+      Layers:
+        - !Ref DependenciesLayer
+      Environment:
+        Variables:
+          LOG_LEVEL: INFO
+          POWERTOOLS_SERVICE_NAME: jyotish-ai-chat
+          ANTHROPIC_API_KEY: !Ref AnthropicApiKey
+      Tags:
+        - Key: Project
+          Value: jyotish-ai
+
+  BookingFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'jyotish-booking-${Stage}'
+      Description: Astrologer booking and appointment management
+      Runtime: python3.11
+      Architectures: [x86_64]
+      Handler: handler.lambda_handler
+      Role: !GetAtt BookingLambdaRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: functions/jyotish-booking.zip
+      MemorySize: 512
+      Timeout: 30
+      Layers:
+        - !Ref DependenciesLayer
+      Environment:
+        Variables:
+          LOG_LEVEL: INFO
+          POWERTOOLS_SERVICE_NAME: jyotish-booking
+          ASTROLOGERS_TABLE: !Sub 'jyotish-astrologers-${Stage}'
+          BOOKINGS_TABLE: !Sub 'jyotish-bookings-${Stage}'
+          SLOTS_TABLE: !Sub 'jyotish-slots-${Stage}'
+      Tags:
+        - Key: Project
+          Value: jyotish-ai
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # API GATEWAY — HTTP API (v2)
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  JyotishAPI:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub 'jyotish-api-${Stage}'
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - '*'
+        AllowHeaders:
+          - Content-Type
+          - Authorization
+          - X-Amz-Date
+          - X-Api-Key
+        AllowMethods:
+          - GET
+          - POST
+          - PUT
+          - DELETE
+          - OPTIONS
+      Tags:
+        Project: jyotish-ai
+
+  JyotishAPIStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref JyotishAPI
+      StageName: !Ref Stage
+      AutoDeploy: true
+
+  # JWT Authorizer backed by Cognito
+  CognitoAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref JyotishAPI
+      AuthorizerType: JWT
+      Name: CognitoAuthorizer
+      IdentitySource:
+        - $request.header.Authorization
+      JwtConfiguration:
+        Issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}'
+        Audience:
+          - !Ref UserPoolClient
+
+  # ─── Lambda Permissions (allow API GW to invoke each function) ─────────────
+
+  ChartFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ChartFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${JyotishAPI}/*'
+
+  PanchangaFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt PanchangaFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${JyotishAPI}/*'
+
+  AIChatFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt AIChatFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${JyotishAPI}/*'
+
+  BookingFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt BookingFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${JyotishAPI}/*'
+
+  # ─── API Gateway Integrations (one per Lambda) ─────────────────────────────
+
+  ChartIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref JyotishAPI
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub
+        - 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FnArn}/invocations'
+        - FnArn: !GetAtt ChartFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  PanchangaIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref JyotishAPI
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub
+        - 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FnArn}/invocations'
+        - FnArn: !GetAtt PanchangaFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  AIChatIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref JyotishAPI
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub
+        - 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FnArn}/invocations'
+        - FnArn: !GetAtt AIChatFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  BookingIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref JyotishAPI
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub
+        - 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FnArn}/invocations'
+        - FnArn: !GetAtt BookingFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  # ─── API Gateway Routes ─────────────────────────────────────────────────────
+  # Auth legend:
+  #   NONE  = public endpoint (no login needed)
+  #   JWT   = requires Cognito login token in Authorization header
+
+  # Chart service — /chart/calculate is public for demo, others need login
+  RouteChartCalculate:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref JyotishAPI
+      RouteKey: 'POST /chart/calculate'
+      Target: !Sub 'integrations/${ChartIntegration}'
+      AuthorizationType: NONE
+
+  RouteChartDivisional:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref JyotishAPI
+      RouteKey: 'POST /chart/divisional/{division}'
+      Target: !Sub 'integrations/${ChartIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CognitoAuthorizer
+
+  RouteDashaCalculate:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref JyotishAPI
+      RouteKey: 'POST /dasha/calculate'
+      Target: !Sub 'integrations/${ChartIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CognitoAuthorizer
+
+  # Panchanga — public (daily almanac, no sensitive data)
+  RoutePanchanga:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref JyotishAPI
+      RouteKey: 'GET /panchanga'
+      Target: !Sub 'integrations/${PanchangaIntegration}'
+      AuthorizationType: NONE
+
+  # AI Chat — protected (costs money per call)
+  RouteAIChat:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref JyotishAPI
+      RouteKey: 'POST /ai/chat'
+      Target: !Sub 'integrations/${AIChatIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CognitoAuthorizer
+
+  # Astrologer listing — public (browsing is free)
+  RouteListAstrologers:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref JyotishAPI
+      RouteKey: 'GET /astrologers'
+      Target: !Sub 'integrations/${BookingIntegration}'
+      AuthorizationType: NONE
+
+  RouteGetAstrologer:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref JyotishAPI
+      RouteKey: 'GET /astrologers/{astrologer_id}'
+      Target: !Sub 'integrations/${BookingIntegration}'
+      AuthorizationType: NONE
+
+  # Slot availability — requires login to prevent scraping
+  RouteGetSlots:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref JyotishAPI
+      RouteKey: 'GET /astrologers/{astrologer_id}/slots'
+      Target: !Sub 'integrations/${BookingIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CognitoAuthorizer
+
+  # Booking CRUD — all protected
+  RouteCreateBooking:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref JyotishAPI
+      RouteKey: 'POST /bookings'
+      Target: !Sub 'integrations/${BookingIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CognitoAuthorizer
+
+  RouteGetMyBookings:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref JyotishAPI
+      RouteKey: 'GET /bookings/my'
+      Target: !Sub 'integrations/${BookingIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CognitoAuthorizer
+
+  RouteCancelBooking:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref JyotishAPI
+      RouteKey: 'DELETE /bookings/{booking_id}'
+      Target: !Sub 'integrations/${BookingIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CognitoAuthorizer
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OUTPUTS  — printed after deploy, used to fill .env
+# ─────────────────────────────────────────────────────────────────────────────
+Outputs:
+  ApiUrl:
+    Description: API Gateway endpoint URL
+    Value: !Sub 'https://${JyotishAPI}.execute-api.${AWS::Region}.amazonaws.com/${Stage}'
+    Export:
+      Name: !Sub 'JyotishApiUrl-${Stage}'
+
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub 'JyotishUserPoolId-${Stage}'
+
+  UserPoolClientId:
+    Description: Cognito App Client ID
+    Value: !Ref UserPoolClient
+    Export:
+      Name: !Sub 'JyotishUserPoolClientId-${Stage}'
+
+  IdentityPoolId:
+    Description: Cognito Identity Pool ID
+    Value: !Ref IdentityPool
+    Export:
+      Name: !Sub 'JyotishIdentityPoolId-${Stage}'
+
+  LambdaLayerArn:
+    Description: ARN of the shared Python dependencies layer
+    Value: !Ref DependenciesLayer
+    Export:
+      Name: !Sub 'JyotishLayerArn-${Stage}'

@@ -1,0 +1,317 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Jyotish AI Backend - Vedic Astrology App
+
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 512
+    Runtime: python3.10
+    Architectures: [arm64]
+    Environment:
+      Variables:
+        LOG_LEVEL: INFO
+        POWERTOOLS_SERVICE_NAME: jyotish-ai
+        AWS_REGION: !Ref AWS::Region
+        ASTROLOGERS_TABLE: !Ref AstrologersTable
+        BOOKINGS_TABLE: !Ref BookingsTable
+        SLOTS_TABLE: !Ref SlotsTable
+    Layers:
+      - !Ref DependenciesLayer
+
+Parameters:
+  Stage:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+  AnthropicApiKey:
+    Type: String
+    NoEcho: true
+    Description: Anthropic API key for Claude
+
+Resources:
+  # ─── API Gateway ─────────────────────────────────────────────────────────────
+  JyotishAPI:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref Stage
+      CorsConfiguration:
+        AllowOrigins: ['*']
+        AllowHeaders: ['Content-Type', 'Authorization', 'X-Amz-Date', 'X-Api-Key']
+        AllowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS']
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        Authorizers:
+          CognitoAuthorizer:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}'
+              audience: [!Ref UserPoolClient]
+
+  # ─── Lambda Functions ─────────────────────────────────────────────────────────
+  ChartFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'jyotish-chart-${Stage}'
+      CodeUri: chart_service/
+      Handler: handler.lambda_handler
+      Description: Calculates birth charts and planetary positions using PyJHora
+      MemorySize: 1024
+      Timeout: 60
+      Events:
+        CalculateChart:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref JyotishAPI
+            Path: /chart/calculate
+            Method: POST
+            Auth:
+              Authorizer: NONE  # Allow unauthenticated for demo
+        GetDivisionalChart:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref JyotishAPI
+            Path: /chart/divisional/{division}
+            Method: POST
+        CalculateDasha:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref JyotishAPI
+            Path: /dasha/calculate
+            Method: POST
+
+  PanchangaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'jyotish-panchanga-${Stage}'
+      CodeUri: panchanga_service/
+      Handler: handler.lambda_handler
+      Description: Daily Vedic almanac calculator
+      Events:
+        GetPanchanga:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref JyotishAPI
+            Path: /panchanga
+            Method: GET
+            Auth:
+              Authorizer: NONE
+
+  AIChatFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'jyotish-ai-chat-${Stage}'
+      CodeUri: ai_service/
+      Handler: handler.lambda_handler
+      Description: AI-powered Vedic astrology chat using Claude
+      MemorySize: 1024
+      Timeout: 60
+      Environment:
+        Variables:
+          ANTHROPIC_API_KEY: !Ref AnthropicApiKey
+      Events:
+        AIChat:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref JyotishAPI
+            Path: /ai/chat
+            Method: POST
+
+  BookingFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'jyotish-booking-${Stage}'
+      CodeUri: booking_service/
+      Handler: handler.lambda_handler
+      Description: Astrologer booking and appointment management
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BookingsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref AstrologersTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SlotsTable
+      Events:
+        ListAstrologers:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref JyotishAPI
+            Path: /astrologers
+            Method: GET
+            Auth:
+              Authorizer: NONE
+        GetAstrologer:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref JyotishAPI
+            Path: /astrologers/{astrologer_id}
+            Method: GET
+            Auth:
+              Authorizer: NONE
+        GetSlots:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref JyotishAPI
+            Path: /astrologers/{astrologer_id}/slots
+            Method: GET
+        CreateBooking:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref JyotishAPI
+            Path: /bookings
+            Method: POST
+        GetMyBookings:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref JyotishAPI
+            Path: /bookings/my
+            Method: GET
+        CancelBooking:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref JyotishAPI
+            Path: /bookings/{booking_id}
+            Method: DELETE
+
+  # ─── Lambda Layers ────────────────────────────────────────────────────────────
+  DependenciesLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub 'jyotish-dependencies-${Stage}'
+      Description: Python dependencies for Jyotish AI
+      ContentUri: .layer/
+      CompatibleRuntimes: [python3.10]
+      RetentionPolicy: Delete
+    Metadata:
+      BuildMethod: python3.10
+
+  # ─── DynamoDB Tables ──────────────────────────────────────────────────────────
+  AstrologersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'jyotish-astrologers-${Stage}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  BookingsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'jyotish-bookings-${Stage}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: booking_id
+          AttributeType: S
+        - AttributeName: user_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: booking_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: user_id-index
+          KeySchema:
+            - AttributeName: user_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  SlotsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'jyotish-slots-${Stage}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: astrologer_id
+          AttributeType: S
+        - AttributeName: date
+          AttributeType: S
+      KeySchema:
+        - AttributeName: astrologer_id
+          KeyType: HASH
+        - AttributeName: date
+          KeyType: RANGE
+
+  # ─── Cognito ──────────────────────────────────────────────────────────────────
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub 'jyotish-users-${Stage}'
+      AutoVerifiedAttributes: [email]
+      UsernameAttributes: [email]
+      MfaConfiguration: OPTIONAL
+      EmailConfiguration:
+        EmailSendingAccount: COGNITO_DEFAULT
+      Schema:
+        - Name: name
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+        - Name: birth_date
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub 'jyotish-app-${Stage}'
+      UserPoolId: !Ref UserPool
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+      GenerateSecret: false
+      AccessTokenValidity: 24
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: hours
+        RefreshToken: days
+
+  IdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      IdentityPoolName: !Sub 'jyotish_identity_${Stage}'
+      AllowUnauthenticatedIdentities: false
+      CognitoIdentityProviders:
+        - ClientId: !Ref UserPoolClient
+          ProviderName: !GetAtt UserPool.ProviderName
+
+Outputs:
+  ApiUrl:
+    Description: API Gateway endpoint URL
+    Value: !Sub 'https://${JyotishAPI}.execute-api.${AWS::Region}.amazonaws.com/${Stage}'
+    Export:
+      Name: !Sub 'JyotishApiUrl-${Stage}'
+
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub 'JyotishUserPoolId-${Stage}'
+
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref UserPoolClient
+    Export:
+      Name: !Sub 'JyotishUserPoolClientId-${Stage}'
+
+  IdentityPoolId:
+    Description: Cognito Identity Pool ID
+    Value: !Ref IdentityPool
+    Export:
+      Name: !Sub 'JyotishIdentityPoolId-${Stage}'
