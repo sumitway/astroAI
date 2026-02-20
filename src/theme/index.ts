@@ -5,12 +5,12 @@ export { Spacing, BorderRadius, Shadow } from './spacing';
 export const Theme = {
   dark: true,
   colors: {
-    primary:    '#667EEA',
-    secondary:  '#764BA2',
-    background: '#03000F',
-    card:       '#0D0B2A',
-    text:       'rgba(255,255,255,0.95)',
-    border:     'rgba(255,255,255,0.12)',
+    primary:      '#D4891A',   // saffron amber
+    secondary:    '#8B2500',   // deep vermillion
+    background:   '#0C0804',   // warm dark
+    card:         '#1A1008',   // warm card
+    text:         'rgba(255,245,230,0.95)',
+    border:       'rgba(212,137,26,0.20)',
     notification: '#FF6B6B',
   },
 } as const;
